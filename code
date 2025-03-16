@@ -1,0 +1,542 @@
+import React, { useState, useEffect, useRef } from 'react';
+import { 
+  View, 
+  Text, 
+  StyleSheet, 
+  Switch, 
+  TextInput, 
+  ScrollView, 
+  Pressable,
+  Platform,
+  Clipboard,
+  AppState,
+  Linking,
+  PermissionsAndroid,
+  ToastAndroid
+} from 'react-native';
+import { MaterialIcons } from '@expo/vector-icons';
+import * as Notifications from 'expo-notifications';
+import * as TaskManager from 'expo-task-manager';
+import * as BackgroundFetch from 'expo-background-fetch';
+import { toast } from 'sonner-native';
+
+const BACKGROUND_FETCH_TASK = 'background-fetch';
+const ACCESSIBILITY_SERVICE = 'LinkMonitorAccessibilityService';
+
+const requestAccessibilityPermission = async () => {
+  if (Platform.OS === 'android') {
+    try {
+      const granted = await PermissionsAndroid.request(
+        PermissionsAndroid.PERMISSIONS.BIND_ACCESSIBILITY_SERVICE,
+        {
+          title: "Link Monitor Accessibility Permission",
+          message: "Link Monitor needs accessibility access to monitor links.",
+          buttonNeutral: "Ask Me Later",
+          buttonNegative: "Cancel",
+          buttonPositive: "OK"
+        }
+      );
+      return granted === PermissionsAndroid.RESULTS.GRANTED;
+    } catch (err) {
+      console.warn(err);
+      return false;
+    }
+  }
+  return false;
+};
+
+const startForegroundService = async () => {
+  if (Platform.OS === 'android') {
+    await Notifications.setNotificationChannelAsync('link-monitor', {
+      name: 'Link Monitor Service',
+      importance: Notifications.AndroidImportance.HIGH,
+      vibrationPattern: [0, 250, 250, 250],
+      lightColor: '#FF231F7C',
+    });
+
+    await Notifications.scheduleNotificationAsync({
+      content: {
+        title: 'Link Monitor Active',
+        body: 'Monitoring system for unsafe links',
+        sticky: true,
+        ongoing: true,
+      },
+      trigger: null,
+    });
+  }
+};
+
+const stopForegroundService = async () => {
+  if (Platform.OS === 'android') {
+    await Notifications.dismissAllNotificationsAsync();
+  }
+};
+
+// Enhanced URL detection
+const extractUrls = (text) => {
+  const urlRegex = /(https?:\/\/[^\s]+)/g;
+  return text.match(urlRegex) || [];
+};
+
+const checkLinkSafety = async (url) => {
+  try {
+    const response = await fetch('https://api.a0.dev/ai/llm', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        messages: [
+          {
+            role: 'system',
+            content: 'You are a URL safety classifier. Analyze the URL and respond with either "⚠️ UNSAFE: [reason]" or "✅ SAFE: [reason]". Consider domain reputation, URL structure, and potential phishing indicators.',
+          },
+          {
+            role: 'user',
+            content: `Analyze this URL for safety: ${url}`,
+          },
+        ],
+      }),
+    });
+    const data = await response.json();
+    return data.completion;
+  } catch (error) {
+    console.error('Error checking link safety:', error);
+    return '❌ Error analyzing link';
+  }
+};
+
+TaskManager.defineTask(BACKGROUND_FETCH_TASK, async () => {
+  try {
+    const clipboardContent = await Clipboard.getString();
+    const urls = extractUrls(clipboardContent);
+    
+    for (const url of urls) {
+      await handleNewLink(url);
+    }
+    
+    return BackgroundFetch.Result.NewData;
+  } catch (error) {
+    return BackgroundFetch.Result.Failed;
+  }
+});
+
+const handleNewLink = async (url) => {
+  const result = await checkLinkSafety(url);
+  const isUnsafe = result.includes('UNSAFE');
+  
+  await Notifications.scheduleNotificationAsync({
+    content: {
+      title: isUnsafe ? '⚠️ Unsafe Link Detected!' : '✅ Safe Link Detected',
+      body: `${url}\n${result}`,
+      data: { url },
+      color: isUnsafe ? '#ff4444' : '#44ff44',
+      sound: isUnsafe ? true : false,
+      priority: isUnsafe ? 'high' : 'default',
+    },
+    trigger: null,
+  });
+
+  return result;
+};
+
+export default function LinkMonitorApp() {
+  const [isEnabled, setIsEnabled] = useState(false);
+  const [inputLink, setInputLink] = useState('');
+  const [monitoredLinks, setMonitoredLinks] = useState([]);
+  const [isAnalyzing, setIsAnalyzing] = useState(false);
+  const [serviceStatus, setServiceStatus] = useState('Stopped');
+  const notificationListener = useRef();
+  const responseListener = useRef();
+
+  const setupAndroidBackgroundService = async () => {
+    if (Platform.OS === 'android') {
+      try {
+        await BackgroundFetch.registerTaskAsync(BACKGROUND_FETCH_TASK, {
+          minimumInterval: 30, // 30 seconds
+          stopOnTerminate: false,
+          startOnBoot: true,
+        });
+
+        await requestAccessibilityPermission();
+        await startForegroundService();
+      } catch (err) {
+        console.error("Failed to setup background service:", err);
+      }
+    }
+  };
+
+  const setupNotifications = async () => {
+    const { status } = await Notifications.requestPermissionsAsync();
+    if (status !== 'granted') {
+      toast.error('Notifications permission required');
+      return;
+    }
+
+    Notifications.setNotificationHandler({
+      handleNotification: async () => ({
+        shouldShowAlert: true,
+        shouldPlaySound: true,
+        shouldSetBadge: true,
+      }),
+    });
+
+    notificationListener.current = Notifications.addNotificationReceivedListener(notification => {
+      const url = notification.request.content.data.url;
+      if (url) {
+        setMonitoredLinks(prev => [{
+          url,
+          timestamp: new Date().toLocaleString(),
+          status: notification.request.content.body,
+        }, ...prev]);
+      }
+    });
+
+    responseListener.current = Notifications.addNotificationResponseReceivedListener(response => {
+      const url = response.notification.request.content.data.url;
+      if (url) {
+        Linking.openURL(url);
+      }
+    });
+  };  // Setup notifications once on component mount
+  useEffect(() => {
+    setupNotifications();
+    
+    return () => {
+      if (notificationListener.current) {
+        Notifications.removeNotificationSubscription(notificationListener.current);
+      }
+      if (responseListener.current) {
+        Notifications.removeNotificationSubscription(responseListener.current);
+      }
+    };
+  }, []);
+
+  // Handle clipboard monitoring separately
+  useEffect(() => {
+    let clipboardInterval;
+    
+    if (isEnabled) {
+      setupAndroidBackgroundService();
+      
+      // Start clipboard monitoring
+      clipboardInterval = setInterval(async () => {
+        try {
+          const content = await Clipboard.getString();
+          const urls = extractUrls(content);
+          
+          for (const url of urls) {
+            if (!monitoredLinks.some(link => link.url === url)) {
+              handleLinkSubmit(url);
+            }
+          }
+        } catch (e) {
+          console.error('Clipboard monitoring error:', e);
+        }
+      }, 2000);
+    } else if (Platform.OS === 'android') {
+      // Just stop the foreground service without dismounting components
+      stopForegroundService().catch(err => console.error('Error stopping service:', err));
+      BackgroundFetch.unregisterTaskAsync(BACKGROUND_FETCH_TASK).catch(err => 
+        console.error('Error unregistering task:', err)
+      );
+    }
+
+    return () => {
+      if (clipboardInterval) {
+        clearInterval(clipboardInterval);
+      }
+    };
+  }, [isEnabled]);  const toggleService = async () => {
+    try {
+      const newState = !isEnabled;
+      if (newState) {
+        toast.success('Link monitoring started');
+        setServiceStatus('Running');
+      } else {
+        toast.success('Link monitoring stopped');
+        setServiceStatus('Stopped');
+      }
+      setIsEnabled(newState);
+    } catch (error) {
+      console.error('Error toggling service:', error);
+      toast.error('Failed to toggle monitoring service');
+    }
+  };  const handleLinkSubmit = async (clipboardLink = null) => {
+    const linkToAnalyze = clipboardLink || inputLink;
+    if (!linkToAnalyze || !isEnabled) return;
+    
+    // Check if this URL is already in our list
+  if (monitoredLinks.some(link => link.url === linkToAnalyze)) {
+  if (!clipboardLink) setInputLink('');
+  return; // Skip if already analyzing this link
+}
+
+    setIsAnalyzing(true);
+    const newLink = {
+      url: linkToAnalyze,
+      timestamp: new Date().toLocaleString(),
+      status: 'Analyzing...',
+    };
+
+    // Add to the list first with "Analyzing..." status
+   const newLinkId = Date.now().toString(); // Create unique ID for this entry
+setMonitoredLinks(prev => [{
+  ...newLink,
+  id: newLinkId
+}, ...prev]);
+
+    try {
+      // Get the analysis result
+      const result = await handleNewLink(linkToAnalyze);
+      
+      // Update only this specific link entry with the result
+    setMonitoredLinks(prev => 
+  prev.map(link => 
+    link.id === newLinkId 
+      ? { ...link, status: result } 
+      : link
+  )
+);
+    } catch (error) {
+      // Handle analysis error
+      setMonitoredLinks(prev => 
+        prev.map(link => 
+          link.id === newLinkId 
+            ? { ...link, status: '❌ Analysis failed' } 
+            : link
+        )
+      );
+    } finally {
+      if (!clipboardLink) {
+        setInputLink('');
+      }
+      setIsAnalyzing(false);
+    }
+  };
+
+  return (
+    <View style={styles.container}>
+      <View style={styles.header}>
+        <Text style={styles.title}>Link Security Monitor</Text>
+        <View style={styles.serviceStatus}>
+          <MaterialIcons 
+            name={isEnabled ? "security" : "security-off"} 
+            size={24} 
+            color={isEnabled ? '#4CAF50' : '#f44336'} 
+          />
+          <Text style={[styles.statusText, { color: isEnabled ? '#4CAF50' : '#f44336' }]}>
+            Service {serviceStatus}
+          </Text>
+        </View>
+        <View style={styles.switchContainer}>
+          <Text style={styles.switchLabel}>
+            {isEnabled ? 'Monitoring Active' : 'Monitoring Inactive'}
+          </Text>
+          <Switch
+            trackColor={{ false: '#767577', true: '#81b0ff' }}
+            thumbColor={isEnabled ? '#4CAF50' : '#f4f3f4'}
+            onValueChange={toggleService}
+            value={isEnabled}
+          />
+        </View>
+      </View>
+
+      <View style={styles.inputContainer}>
+        <TextInput
+          style={styles.input}
+          value={inputLink}
+          onChangeText={setInputLink}
+          placeholder="Enter or paste a link to analyze"
+          placeholderTextColor="#666"
+        />
+        <Pressable 
+          style={[styles.button, (!isEnabled || !inputLink) && styles.buttonDisabled]}
+          disabled={!isEnabled || !inputLink}
+          onPress={() => handleLinkSubmit()}
+          android_ripple={{ color: 'rgba(255, 255, 255, 0.3)' }}
+        >
+          <MaterialIcons 
+            name="security" 
+            size={24} 
+            color={(!isEnabled || !inputLink) ? '#666' : 'white'} 
+          />
+        </Pressable>
+      </View>      <ScrollView style={styles.linksContainer}>
+        {monitoredLinks.length === 0 ? (
+          <View style={styles.emptyState}>
+            <MaterialIcons name="security" size={48} color="#ccc" />
+            <Text style={styles.emptyStateText}>No links monitored yet</Text>
+            <Text style={styles.emptyStateSubtext}>
+              Links you analyze will appear here
+            </Text>
+          </View>
+        ) : (
+          monitoredLinks.map((link, index) => (
+            <Pressable
+              key={link.id || index}
+              style={styles.linkItem}
+              onPress={() => Linking.openURL(link.url)}
+              android_ripple={{ color: 'rgba(0, 0, 0, 0.1)' }}
+            >
+              <Text style={styles.linkUrl} numberOfLines={1}>{link.url}</Text>
+              <Text style={styles.linkTimestamp}>{link.timestamp}</Text>
+              <Text style={[
+                styles.linkStatus,
+                link.status.includes('SAFE') ? styles.safeLinkStatus : 
+                link.status.includes('UNSAFE') ? styles.unsafeLinkStatus :
+                styles.analyzingLinkStatus
+              ]}>
+                {link.status}
+              </Text>
+            </Pressable>
+          ))
+        )}
+      </ScrollView>
+
+      {isAnalyzing && (
+        <View style={styles.analyzing}>
+          <MaterialIcons name="security" size={24} color="#2196F3" />
+          <Text style={styles.analyzingText}>Analyzing link...</Text>
+        </View>
+      )}
+    </View>
+  );
+}  const styles = StyleSheet.create({
+    emptyState: {
+      alignItems: 'center',
+      justifyContent: 'center',
+      padding: 40,
+      opacity: 0.7,
+    },
+    emptyStateText: {
+      fontSize: 18,
+      color: '#555',
+      marginTop: 16,
+      fontWeight: 'bold',
+    },
+    emptyStateSubtext: {
+      fontSize: 14,
+      color: '#777',
+      marginTop: 8,
+      textAlign: 'center',
+    },
+  container: {
+    flex: 1,
+    backgroundColor: '#f5f5f5',
+    padding: 14,
+  },
+  header: {
+    marginBottom: 10,
+  },
+  title: {
+    fontSize: 24,
+    fontWeight: 'bold',
+    color: '#333',
+    marginBottom: 30,
+    marginTop: 40,
+  },
+  serviceStatus: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    marginBottom: 10,
+    backgroundColor: 'white',
+    padding: 12,
+    borderRadius: 12,
+    elevation: 2,
+  },
+  statusText: {
+    marginLeft: 8,
+    fontSize: 16,
+    fontWeight: 'bold',
+  },
+  switchContainer: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    backgroundColor: 'white',
+    padding: 16,
+    borderRadius: 12,
+    elevation: 2,
+  },
+  switchLabel: {
+    fontSize: 16,
+    color: '#333',
+  },
+  inputContainer: {
+    flexDirection: 'row',
+    marginBottom: 20,
+  },
+  input: {
+    flex: 1,
+    backgroundColor: 'white',
+    padding: 12,
+    borderRadius: 12,
+    marginRight: 8,
+    fontSize: 16,
+    elevation: 2,
+  },
+  button: {
+    backgroundColor: '#4CAF50',
+    padding: 12,
+    borderRadius: 12,
+    justifyContent: 'center',
+    alignItems: 'center',
+    elevation: 4,
+  },
+  buttonDisabled: {
+    backgroundColor: '#cccccc',
+    elevation: 0,
+  },
+  linksContainer: {
+    flex: 1,
+  },
+  linkItem: {
+    backgroundColor: 'white',
+    padding: 16,
+    borderRadius: 12,
+    marginBottom: 8,
+    elevation: 2,
+  },
+  linkUrl: {
+    fontSize: 16,
+    color: '#333',
+    marginBottom: 4,
+  },
+  linkTimestamp: {
+    fontSize: 12,
+    color: '#666',
+    marginBottom: 4,
+  },
+  linkStatus: {
+    fontSize: 14,
+    fontWeight: 'bold',
+  },
+  safeLinkStatus: {
+    color: '#4CAF50',
+  },
+  unsafeLinkStatus: {
+    color: '#f44336',
+  },
+  analyzingLinkStatus: {
+    color: '#2196F3',
+  },
+  analyzing: {
+    position: 'absolute',
+    bottom: 20,
+    left: 20,
+    right: 20,
+    backgroundColor: 'white',
+    padding: 16,
+    borderRadius: 12,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    elevation: 8,
+  },
+  analyzingText: {
+    marginLeft: 8,
+    fontSize: 16,
+    color: '#2196F3',
+  },
+});
